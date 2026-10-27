@@ -16,6 +16,7 @@ package rxe
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/nickgarlis/rdma"
 )
@@ -31,21 +32,89 @@ func Open(name string) (*rdma.Device, error) {
 // itself when a QP moves to RESET.
 type provider struct {
 	dev *rdma.Device
+
+	// cqs and qps hold the live CQs and QPs, whose rings Close unmaps.
+	mu  sync.Mutex
+	cqs map[*cqState]struct{}
+	qps map[*queuePair]struct{}
 }
 
 func (p *provider) Init(dev *rdma.Device) (*rdma.Context, error) {
 	if p.dev != nil {
-		return nil, errors.New("rxe: provider already serves a device")
+		return nil, errProviderInUse
 	}
 
 	p.dev = dev
+	p.cqs = make(map[*cqState]struct{})
+	p.qps = make(map[*queuePair]struct{})
 
 	// rxe takes no driver data for its context.
 	return dev.Cmd().GetContext(nil)
 }
 
 func (*provider) DriverID() rdma.DriverID { return rdma.DriverRXE }
-func (*provider) Close() error            { return nil }
+
+// Close unmaps the rings of the CQs and QPs that are still open. The Device
+// calls it before closing the device file, which would unmap them under any
+// poll or post still running.
+func (p *provider) Close() error {
+	p.mu.Lock()
+	cqs, qps := p.cqs, p.qps
+	p.cqs, p.qps = nil, nil
+	p.mu.Unlock()
+
+	var errs []error
+	for c := range cqs {
+		errs = append(errs, c.close())
+	}
+
+	for q := range qps {
+		errs = append(errs, q.close())
+	}
+
+	return errors.Join(errs...)
+}
+
+// addCQ and addQP record a new CQ or QP, so that Close unmaps its rings. They
+// fail once Close has started, since it would not see the object.
+func (p *provider) addCQ(c *cqState) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.cqs == nil {
+		return errProviderClosed
+	}
+
+	p.cqs[c] = struct{}{}
+	return nil
+}
+
+func (p *provider) addQP(q *queuePair) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.qps == nil {
+		return errProviderClosed
+	}
+
+	p.qps[q] = struct{}{}
+	return nil
+}
+
+// removeCQ and removeQP forget a destroyed CQ or QP.
+func (p *provider) removeCQ(c *cqState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.cqs, c)
+}
+
+func (p *provider) removeQP(q *queuePair) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.qps, q)
+}
 
 func (p *provider) AllocPD() (*rdma.PD, error)  { return p.dev.Cmd().AllocPD() }
 func (p *provider) DeallocPD(pd *rdma.PD) error { return p.dev.Cmd().DeallocPD(pd) }

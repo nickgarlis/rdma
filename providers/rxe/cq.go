@@ -4,7 +4,6 @@ package rxe
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"sync"
 
@@ -36,7 +35,14 @@ func (p *provider) CreateCQ(cqe uint32, channel *rdma.CompChannel, compVector ui
 		return nil, err
 	}
 
-	cq.SetProviderData(&cqState{q: q})
+	c := &cqState{q: q}
+	if err := p.addCQ(c); err != nil {
+		_ = q.close()
+		_ = p.dev.Cmd().DestroyCQ(cq)
+		return nil, err
+	}
+
+	cq.SetProviderData(c)
 	return cq, nil
 }
 
@@ -46,11 +52,21 @@ func (p *provider) DestroyCQ(cq *rdma.CQ) error {
 		return err
 	}
 
+	// Holding the lock makes a concurrent poll wait, and the closed ring
+	// makes later polls fail, instead of reading unmapped memory.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.q == nil {
+		return errCQClosed
+	}
+
 	if err := p.dev.Cmd().DestroyCQ(cq); err != nil {
 		return err
 	}
 
-	return c.q.close()
+	p.removeCQ(c)
+	return c.closeLocked()
 }
 
 func (p *provider) PollCQ(cq *rdma.CQ, wc []rdma.WC) (int, error) {
@@ -61,8 +77,6 @@ func (p *provider) PollCQ(cq *rdma.CQ, wc []rdma.WC) (int, error) {
 
 	return c.poll(wc)
 }
-
-var errForeignCQ = errors.New("rxe: CQ has no rxe state")
 
 // cqOf returns the rxe state of cq.
 func cqOf(cq *rdma.CQ) (*cqState, error) {
@@ -78,7 +92,25 @@ func cqOf(cq *rdma.CQ) (*cqState, error) {
 // entries and poll consumes them.
 type cqState struct {
 	mu sync.Mutex
-	q  *queue
+	q  *queue // nil once the ring is unmapped
+}
+
+// close unmaps the CQ's ring.
+func (c *cqState) close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.closeLocked()
+}
+
+func (c *cqState) closeLocked() error {
+	if c.q == nil {
+		return nil
+	}
+
+	err := c.q.close()
+	c.q = nil
+	return err
 }
 
 func (c *cqState) poll(wc []rdma.WC) (int, error) {
@@ -86,6 +118,9 @@ func (c *cqState) poll(wc []rdma.WC) (int, error) {
 	defer c.mu.Unlock()
 
 	q := c.q
+	if q == nil {
+		return 0, errCQClosed
+	}
 	cons := q.consumer()
 	prod := q.producer()
 

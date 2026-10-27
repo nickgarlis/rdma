@@ -41,7 +41,14 @@ func (p *provider) CreateQP(pd *rdma.PD, attr *rdma.QPInitAttr) (*rdma.QP, error
 		return nil, err
 	}
 
-	qp.SetProviderData(&queuePair{dev: p.dev, qp: qp, cap: qp.Cap, sq: sq, rq: rq})
+	q := &queuePair{dev: p.dev, qp: qp, cap: qp.Cap, sq: sq, rq: rq}
+	if err := p.addQP(q); err != nil {
+		_ = q.closeLocked()
+		_ = p.dev.Cmd().DestroyQP(qp)
+		return nil, err
+	}
+
+	qp.SetProviderData(q)
 	return qp, nil
 }
 
@@ -51,11 +58,23 @@ func (p *provider) DestroyQP(qp *rdma.QP) error {
 		return err
 	}
 
+	// Holding the locks makes concurrent posts wait, and the closed rings
+	// make later posts fail, instead of writing to unmapped memory.
+	q.sqMu.Lock()
+	defer q.sqMu.Unlock()
+	q.rqMu.Lock()
+	defer q.rqMu.Unlock()
+
+	if q.sq == nil {
+		return errQPClosed
+	}
+
 	if err := p.dev.Cmd().DestroyQP(qp); err != nil {
 		return err
 	}
 
-	return q.close()
+	p.removeQP(q)
+	return q.closeLocked()
 }
 
 func (p *provider) PostSend(qp *rdma.QP, wr ...rdma.SendWR) error {
@@ -76,8 +95,6 @@ func (p *provider) PostRecv(qp *rdma.QP, wr ...rdma.RecvWR) error {
 	return q.postRecv(wr)
 }
 
-var errForeignQP = errors.New("rxe: QP has no rxe state")
-
 // qpOf returns the rxe state of qp.
 func qpOf(qp *rdma.QP) (*queuePair, error) {
 	q, ok := qp.ProviderData[*queuePair]()
@@ -95,6 +112,8 @@ type queuePair struct {
 	qp  *rdma.QP
 	cap rdma.QPCap
 
+	// The rings are nil once unmapped. Code that needs both locks takes
+	// sqMu first.
 	sqMu sync.Mutex
 	sq   *queue
 
@@ -102,10 +121,12 @@ type queuePair struct {
 	rq   *queue
 }
 
-var errQueueFull = errors.New("rxe: work queue full")
-
 func (p *queuePair) postSend(wrs []rdma.SendWR) error {
 	p.sqMu.Lock()
+	if p.sq == nil {
+		p.sqMu.Unlock()
+		return errQPClosed
+	}
 
 	var (
 		err    error
@@ -155,7 +176,7 @@ func (p *queuePair) postOneSend(wr *rdma.SendWR) error {
 
 	isAtomic := wr.Opcode == rdma.WRAtomicCmpAndSwp || wr.Opcode == rdma.WRAtomicFetchAndAdd
 	if isAtomic && (length < 8 || wr.RemoteAddr&7 != 0) {
-		return errors.New("atomic operations need an 8-byte, 8-byte aligned buffer")
+		return errAtomicAlignment
 	}
 
 	w := rxeSendWQE{
@@ -215,13 +236,16 @@ func (p *queuePair) ringSendDoorbell() error {
 
 func (p *queuePair) postRecv(wrs []rdma.RecvWR) error {
 	if p.qp.State() == rdma.QPStateReset {
-		return errors.New("rxe: post receive: QP is in the RESET state")
+		return errQPReset
 	}
 
 	p.rqMu.Lock()
 	defer p.rqMu.Unlock()
 
 	q := p.rq
+	if q == nil {
+		return errQPClosed
+	}
 	for i := range wrs {
 		wr := &wrs[i]
 
@@ -260,8 +284,24 @@ func (p *queuePair) postRecv(wrs []rdma.RecvWR) error {
 	return nil
 }
 
+// close unmaps the QP's rings.
 func (p *queuePair) close() error {
-	return errors.Join(p.sq.close(), p.rq.close())
+	p.sqMu.Lock()
+	defer p.sqMu.Unlock()
+	p.rqMu.Lock()
+	defer p.rqMu.Unlock()
+
+	return p.closeLocked()
+}
+
+func (p *queuePair) closeLocked() error {
+	if p.sq == nil {
+		return nil
+	}
+
+	err := errors.Join(p.sq.close(), p.rq.close())
+	p.sq, p.rq = nil, nil
+	return err
 }
 
 // userBytes returns the n bytes at virtual address addr, which an SGE
