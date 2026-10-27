@@ -1,10 +1,9 @@
 //go:build linux
 
-package rxe_test
+package integration
 
 import (
 	"net"
-	"os"
 	"testing"
 	"time"
 
@@ -14,15 +13,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The tests need an rxe device named by RDMA_TEST_DEVICE. internal/vmtest
-// runs them in a virtual machine after creating one.
+// openDevice opens the rxe device named by RDMA_TEST_DEVICE.
 func openDevice(t *testing.T) *rdma.Device {
 	t.Helper()
 
-	name := os.Getenv("RDMA_TEST_DEVICE")
-	if name == "" {
-		t.Skip("RDMA_TEST_DEVICE is not set")
-	}
+	name := testEnv(t, "RDMA_TEST_DEVICE")
 
 	// Open fails if the device is not an rxe device, since the provider
 	// only supports rxe.

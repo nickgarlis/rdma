@@ -1,6 +1,6 @@
 //go:build linux
 
-package rxe_test
+package integration
 
 import (
 	"bytes"
