@@ -5,6 +5,7 @@ package rxe
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -25,8 +26,13 @@ const (
 // A queue is a struct rxe_queue_buf ring shared with the kernel. Indices are
 // read and written atomically; the kernel pairs them with acquire and
 // release ordering.
+//
+// Every access to the ring holds the queue's lock, taken with lock, which
+// fails once the queue is closed. Closing unmaps the ring under the same
+// lock, so a ring is never used while or after it is unmapped.
 type queue struct {
-	mem      *uverbs.Mapping
+	mu       sync.Mutex
+	mem      *uverbs.Mapping // nil once closed
 	buf      []byte
 	log2Elem uint32
 	mask     uint32
@@ -59,7 +65,38 @@ func mapQueue(dev *rdma.Device, mi mmapInfo) (*queue, error) {
 	return q, nil
 }
 
-func (q *queue) close() error { return q.mem.Close() }
+// lock locks the queue for using its ring. It fails, leaving the queue
+// unlocked, if the queue is closed.
+func (q *queue) lock() error {
+	q.mu.Lock()
+	if q.mem == nil {
+		q.mu.Unlock()
+		return errQueueClosed
+	}
+
+	return nil
+}
+
+func (q *queue) unlock() { q.mu.Unlock() }
+
+// close unmaps the ring. Closing a closed queue does nothing.
+func (q *queue) close() error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.closeLocked()
+}
+
+// closeLocked is close for a caller that holds the lock.
+func (q *queue) closeLocked() error {
+	if q.mem == nil {
+		return nil
+	}
+
+	err := q.mem.Close()
+	q.mem, q.buf = nil, nil
+	return err
+}
 
 func (q *queue) elemSize() int { return 1 << q.log2Elem }
 

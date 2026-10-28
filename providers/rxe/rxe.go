@@ -33,9 +33,10 @@ func Open(name string) (*rdma.Device, error) {
 type provider struct {
 	dev *rdma.Device
 
-	// cqs and qps hold the live CQs and QPs, whose rings Close unmaps.
+	// cqs and qps hold the rings of the live CQs and the live QPs, which
+	// Close unmaps.
 	mu  sync.Mutex
-	cqs map[*cqState]struct{}
+	cqs map[*queue]struct{}
 	qps map[*queuePair]struct{}
 }
 
@@ -45,7 +46,7 @@ func (p *provider) Init(dev *rdma.Device) (*rdma.Context, error) {
 	}
 
 	p.dev = dev
-	p.cqs = make(map[*cqState]struct{})
+	p.cqs = make(map[*queue]struct{})
 	p.qps = make(map[*queuePair]struct{})
 
 	// rxe takes no driver data for its context.
@@ -77,7 +78,7 @@ func (p *provider) Close() error {
 
 // addCQ and addQP record a new CQ or QP, so that Close unmaps its rings. They
 // fail once Close has started, since it would not see the object.
-func (p *provider) addCQ(c *cqState) error {
+func (p *provider) addCQ(q *queue) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -85,7 +86,7 @@ func (p *provider) addCQ(c *cqState) error {
 		return errProviderClosed
 	}
 
-	p.cqs[c] = struct{}{}
+	p.cqs[q] = struct{}{}
 	return nil
 }
 
@@ -102,11 +103,11 @@ func (p *provider) addQP(q *queuePair) error {
 }
 
 // removeCQ and removeQP forget a destroyed CQ or QP.
-func (p *provider) removeCQ(c *cqState) {
+func (p *provider) removeCQ(q *queue) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	delete(p.cqs, c)
+	delete(p.cqs, q)
 }
 
 func (p *provider) removeQP(q *queuePair) {

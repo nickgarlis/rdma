@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sync"
 	"unsafe"
 
 	"github.com/nickgarlis/rdma"
@@ -43,7 +42,7 @@ func (p *provider) CreateQP(pd *rdma.PD, attr *rdma.QPInitAttr) (*rdma.QP, error
 
 	q := &queuePair{dev: p.dev, qp: qp, cap: qp.Cap, sq: sq, rq: rq}
 	if err := p.addQP(q); err != nil {
-		_ = q.closeLocked()
+		_ = q.close()
 		_ = p.dev.Cmd().DestroyQP(qp)
 		return nil, err
 	}
@@ -58,23 +57,24 @@ func (p *provider) DestroyQP(qp *rdma.QP) error {
 		return err
 	}
 
-	// Holding the locks makes concurrent posts wait, and the closed rings
-	// make later posts fail, instead of writing to unmapped memory.
-	q.sqMu.Lock()
-	defer q.sqMu.Unlock()
-	q.rqMu.Lock()
-	defer q.rqMu.Unlock()
-
-	if q.sq == nil {
-		return errQPClosed
+	// Holding the rings' locks makes concurrent posts wait, and the closed
+	// rings make later posts fail. The send queue's lock comes first.
+	if err := q.sq.lock(); err != nil {
+		return err
 	}
+	defer q.sq.unlock()
+
+	if err := q.rq.lock(); err != nil {
+		return err
+	}
+	defer q.rq.unlock()
 
 	if err := p.dev.Cmd().DestroyQP(qp); err != nil {
 		return err
 	}
 
 	p.removeQP(q)
-	return q.closeLocked()
+	return errors.Join(q.sq.closeLocked(), q.rq.closeLocked())
 }
 
 func (p *provider) PostSend(qp *rdma.QP, wr ...rdma.SendWR) error {
@@ -112,20 +112,13 @@ type queuePair struct {
 	qp  *rdma.QP
 	cap rdma.QPCap
 
-	// The rings are nil once unmapped. Code that needs both locks takes
-	// sqMu first.
-	sqMu sync.Mutex
-	sq   *queue
-
-	rqMu sync.Mutex
-	rq   *queue
+	sq *queue
+	rq *queue
 }
 
 func (p *queuePair) postSend(wrs []rdma.SendWR) error {
-	p.sqMu.Lock()
-	if p.sq == nil {
-		p.sqMu.Unlock()
-		return errQPClosed
+	if err := p.sq.lock(); err != nil {
+		return err
 	}
 
 	var (
@@ -142,7 +135,7 @@ func (p *queuePair) postSend(wrs []rdma.SendWR) error {
 		posted++
 	}
 
-	p.sqMu.Unlock()
+	p.sq.unlock()
 
 	if posted > 0 {
 		if derr := p.ringSendDoorbell(); derr != nil {
@@ -239,13 +232,12 @@ func (p *queuePair) postRecv(wrs []rdma.RecvWR) error {
 		return errQPReset
 	}
 
-	p.rqMu.Lock()
-	defer p.rqMu.Unlock()
-
 	q := p.rq
-	if q == nil {
-		return errQPClosed
+	if err := q.lock(); err != nil {
+		return err
 	}
+	defer q.unlock()
+
 	for i := range wrs {
 		wr := &wrs[i]
 
@@ -286,22 +278,7 @@ func (p *queuePair) postRecv(wrs []rdma.RecvWR) error {
 
 // close unmaps the QP's rings.
 func (p *queuePair) close() error {
-	p.sqMu.Lock()
-	defer p.sqMu.Unlock()
-	p.rqMu.Lock()
-	defer p.rqMu.Unlock()
-
-	return p.closeLocked()
-}
-
-func (p *queuePair) closeLocked() error {
-	if p.sq == nil {
-		return nil
-	}
-
-	err := errors.Join(p.sq.close(), p.rq.close())
-	p.sq, p.rq = nil, nil
-	return err
+	return errors.Join(p.sq.close(), p.rq.close())
 }
 
 // userBytes returns the n bytes at virtual address addr, which an SGE

@@ -5,7 +5,6 @@ package rxe
 import (
 	"encoding/binary"
 	"fmt"
-	"sync"
 
 	"github.com/nickgarlis/rdma"
 )
@@ -35,92 +34,64 @@ func (p *provider) CreateCQ(cqe uint32, channel *rdma.CompChannel, compVector ui
 		return nil, err
 	}
 
-	c := &cqState{q: q}
-	if err := p.addCQ(c); err != nil {
+	if err := p.addCQ(q); err != nil {
 		_ = q.close()
 		_ = p.dev.Cmd().DestroyCQ(cq)
 		return nil, err
 	}
 
-	cq.SetProviderData(c)
+	cq.SetProviderData(q)
 	return cq, nil
 }
 
 func (p *provider) DestroyCQ(cq *rdma.CQ) error {
-	c, err := cqOf(cq)
+	q, err := cqOf(cq)
 	if err != nil {
 		return err
 	}
 
-	// Holding the lock makes a concurrent poll wait, and the closed ring
-	// makes later polls fail, instead of reading unmapped memory.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.q == nil {
-		return errCQClosed
+	// Holding the ring's lock makes a concurrent poll wait, and the closed
+	// ring makes later polls fail.
+	if err := q.lock(); err != nil {
+		return err
 	}
+	defer q.unlock()
 
 	if err := p.dev.Cmd().DestroyCQ(cq); err != nil {
 		return err
 	}
 
-	p.removeCQ(c)
-	return c.closeLocked()
+	p.removeCQ(q)
+	return q.closeLocked()
 }
 
 func (p *provider) PollCQ(cq *rdma.CQ, wc []rdma.WC) (int, error) {
-	c, err := cqOf(cq)
+	q, err := cqOf(cq)
 	if err != nil {
 		return 0, err
 	}
 
-	return c.poll(wc)
+	return pollCQ(q, wc)
 }
 
-// cqOf returns the rxe state of cq.
-func cqOf(cq *rdma.CQ) (*cqState, error) {
-	c, ok := cq.ProviderData[*cqState]()
-	if !ok || c == nil {
+// cqOf returns the ring of cq, the provider state of a CQ.
+func cqOf(cq *rdma.CQ) (*queue, error) {
+	q, ok := cq.ProviderData[*queue]()
+	if !ok || q == nil {
 		return nil, errForeignCQ
 	}
 
-	return c, nil
+	return q, nil
 }
 
-// cqState is the provider state of a CQ. The kernel produces ib_uverbs_wc
-// entries and poll consumes them.
-type cqState struct {
-	mu sync.Mutex
-	q  *queue // nil once the ring is unmapped
-}
-
-// close unmaps the CQ's ring.
-func (c *cqState) close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.closeLocked()
-}
-
-func (c *cqState) closeLocked() error {
-	if c.q == nil {
-		return nil
+// pollCQ consumes the ib_uverbs_wc entries the kernel produced into the CQ
+// ring q.
+func pollCQ(q *queue, wc []rdma.WC) (int, error) {
+	if err := q.lock(); err != nil {
+		return 0, err
 	}
+	defer q.unlock()
 
-	err := c.q.close()
-	c.q = nil
-	return err
-}
-
-func (c *cqState) poll(wc []rdma.WC) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	q := c.q
-	if q == nil {
-		return 0, errCQClosed
-	}
 	cons := q.consumer()
 	prod := q.producer()
 
