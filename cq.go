@@ -5,6 +5,7 @@ package rdma
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 )
 
 // A CQ is a completion queue.
@@ -23,6 +24,7 @@ type CQ struct {
 	Channel *CompChannel
 
 	userHandle uint64
+	destroyed  atomic.Bool
 
 	providerData
 }
@@ -79,7 +81,13 @@ func (d *Device) DestroyCQ(cq *CQ) error {
 		return err
 	}
 
+	// The kernel reuses handles, so a second destroy could hit another CQ.
+	if !cq.destroyed.CompareAndSwap(false, true) {
+		return errDestroyed
+	}
+
 	if err := d.provider.DestroyCQ(cq); err != nil {
+		cq.destroyed.Store(false)
 		return err
 	}
 

@@ -3,11 +3,13 @@
 package integration
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/nickgarlis/rdma"
+	"github.com/nickgarlis/rdma/uverbs"
 )
 
 // The rings of a destroyed CQ or QP, or of a closed device, are unmapped.
@@ -17,8 +19,16 @@ import (
 func wantClosed(t *testing.T, what string, err error) {
 	t.Helper()
 
-	if err == nil || !strings.Contains(err.Error(), "destroyed or its device closed") {
-		t.Fatalf("%s: got error %v, want a destroyed-or-closed error", what, err)
+	if !errors.Is(err, uverbs.ErrClosed) {
+		t.Fatalf("%s: got error %v, want uverbs.ErrClosed", what, err)
+	}
+}
+
+func wantDestroyed(t *testing.T, what string, err error) {
+	t.Helper()
+
+	if err == nil || !strings.Contains(err.Error(), "already destroyed") {
+		t.Fatalf("%s: got error %v, want an already-destroyed error", what, err)
 	}
 }
 
@@ -52,7 +62,7 @@ func TestUseAfterDestroy(t *testing.T) {
 	}
 
 	wantClosed(t, "PostSend after DestroyQP", dev.PostSend(qp, rdma.SendWR{Opcode: rdma.WRSend}))
-	wantClosed(t, "DestroyQP twice", dev.DestroyQP(qp))
+	wantDestroyed(t, "DestroyQP twice", dev.DestroyQP(qp))
 
 	if err := dev.DestroyCQ(cq); err != nil {
 		t.Fatalf("DestroyCQ: %v", err)
@@ -60,7 +70,7 @@ func TestUseAfterDestroy(t *testing.T) {
 
 	_, err = dev.PollCQ(cq, make([]rdma.WC, 1))
 	wantClosed(t, "PollCQ after DestroyCQ", err)
-	wantClosed(t, "DestroyCQ twice", dev.DestroyCQ(cq))
+	wantDestroyed(t, "DestroyCQ twice", dev.DestroyCQ(cq))
 }
 
 func TestPollDuringDestroy(t *testing.T) {

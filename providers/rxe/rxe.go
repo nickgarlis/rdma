@@ -15,9 +15,6 @@
 package rxe
 
 import (
-	"errors"
-	"sync"
-
 	"github.com/nickgarlis/rdma"
 )
 
@@ -32,12 +29,6 @@ func Open(name string) (*rdma.Device, error) {
 // itself when a QP moves to RESET.
 type provider struct {
 	dev *rdma.Device
-
-	// cqs and qps hold the rings of the live CQs and the live QPs, which
-	// Close unmaps.
-	mu  sync.Mutex
-	cqs map[*queue]struct{}
-	qps map[*queuePair]struct{}
 }
 
 func (p *provider) Init(dev *rdma.Device) (*rdma.Context, error) {
@@ -46,8 +37,6 @@ func (p *provider) Init(dev *rdma.Device) (*rdma.Context, error) {
 	}
 
 	p.dev = dev
-	p.cqs = make(map[*queue]struct{})
-	p.qps = make(map[*queuePair]struct{})
 
 	// rxe takes no driver data for its context.
 	return dev.Cmd().GetContext(nil)
@@ -55,67 +44,9 @@ func (p *provider) Init(dev *rdma.Device) (*rdma.Context, error) {
 
 func (*provider) DriverID() rdma.DriverID { return rdma.DriverRXE }
 
-// Close unmaps the rings of the CQs and QPs that are still open. The Device
-// calls it before closing the device file, which would unmap them under any
-// poll or post still running.
-func (p *provider) Close() error {
-	p.mu.Lock()
-	cqs, qps := p.cqs, p.qps
-	p.cqs, p.qps = nil, nil
-	p.mu.Unlock()
-
-	var errs []error
-	for c := range cqs {
-		errs = append(errs, c.close())
-	}
-
-	for q := range qps {
-		errs = append(errs, q.close())
-	}
-
-	return errors.Join(errs...)
-}
-
-// addCQ and addQP record a new CQ or QP, so that Close unmaps its rings. They
-// fail once Close has started, since it would not see the object.
-func (p *provider) addCQ(q *queue) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.cqs == nil {
-		return errProviderClosed
-	}
-
-	p.cqs[q] = struct{}{}
-	return nil
-}
-
-func (p *provider) addQP(q *queuePair) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.qps == nil {
-		return errProviderClosed
-	}
-
-	p.qps[q] = struct{}{}
-	return nil
-}
-
-// removeCQ and removeQP forget a destroyed CQ or QP.
-func (p *provider) removeCQ(q *queue) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	delete(p.cqs, q)
-}
-
-func (p *provider) removeQP(q *queuePair) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	delete(p.qps, q)
-}
+// Close has nothing to release: closing the device file unmaps the rings of
+// the CQs and QPs still open, after any running poll or post returns.
+func (*provider) Close() error { return nil }
 
 func (p *provider) AllocPD() (*rdma.PD, error)  { return p.dev.Cmd().AllocPD() }
 func (p *provider) DeallocPD(pd *rdma.PD) error { return p.dev.Cmd().DeallocPD(pd) }

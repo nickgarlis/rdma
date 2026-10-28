@@ -5,7 +5,6 @@ package rxe
 import (
 	"encoding/binary"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -23,22 +22,17 @@ const (
 	queueData         = 384
 )
 
-// A queue is a struct rxe_queue_buf ring shared with the kernel. Indices are
-// read and written atomically; the kernel pairs them with acquire and
-// release ordering.
-//
-// Every access to the ring holds the queue's lock, taken with lock, which
-// fails once the queue is closed. Closing unmaps the ring under the same
-// lock, so a ring is never used while or after it is unmapped.
+// A queue is a struct rxe_queue_buf ring shared with the kernel, mapped from
+// the device file. Its memory is only reachable inside do, under the
+// mapping's lock, so it is never used while or after it is unmapped.
 type queue struct {
-	mu       sync.Mutex
-	mem      *uverbs.Mapping // nil once closed
-	buf      []byte
+	mem      *uverbs.Mapping
 	log2Elem uint32
 	mask     uint32
 }
 
-func mapQueue(dev *rdma.Device, mi mmapInfo) (*queue, error) {
+// newQueue maps the ring described by mi from the device file.
+func newQueue(dev *rdma.Device, mi mmapInfo) (*queue, error) {
 	if mi.Size < queueData {
 		return nil, fmt.Errorf("rxe: queue of %d bytes is too small", mi.Size)
 	}
@@ -48,72 +42,122 @@ func mapQueue(dev *rdma.Device, mi mmapInfo) (*queue, error) {
 		return nil, fmt.Errorf("rxe: map queue: %w", err)
 	}
 
-	buf := mem.Bytes()
-	q := &queue{
-		mem:      mem,
-		buf:      buf,
-		log2Elem: binary.NativeEndian.Uint32(buf[queueLog2ElemSize:]),
-		mask:     binary.NativeEndian.Uint32(buf[queueIndexMask:]),
-	}
+	// The ring's geometry is read once: the kernel never changes it, and
+	// later changes to the shared memory must not move the bounds.
+	q := &queue{mem: mem}
+	if err := mem.Do(func(b []byte) error {
+		q.log2Elem = binary.NativeEndian.Uint32(b[queueLog2ElemSize:])
+		q.mask = binary.NativeEndian.Uint32(b[queueIndexMask:])
 
-	if end := queueData + (uint64(q.mask)+1)<<q.log2Elem; end > uint64(len(buf)) {
+		if end := queueData + (uint64(q.mask)+1)<<q.log2Elem; end > uint64(len(b)) {
+			return fmt.Errorf("rxe: queue of %d elements of %d bytes exceeds mapping of %d bytes",
+				q.mask+1, q.elemSize(), len(b))
+		}
+
+		return nil
+	}); err != nil {
 		_ = mem.Close()
-		return nil, fmt.Errorf("rxe: queue of %d elements of %d bytes exceeds mapping of %d bytes",
-			q.mask+1, q.elemSize(), len(buf))
+		return nil, err
 	}
 
 	return q, nil
 }
 
-// lock locks the queue for using its ring. It fails, leaving the queue
-// unlocked, if the queue is closed.
-func (q *queue) lock() error {
-	q.mu.Lock()
-	if q.mem == nil {
-		q.mu.Unlock()
-		return errQueueClosed
-	}
+// produce fills up to n free slots of the ring with fill, in order, and
+// makes them visible to the kernel with a single producer update. It stops at
+// the first fill error, or with errQueueFull when the ring runs full, and
+// returns how many slots it produced: those are published even if a later
+// one failed. It fails with uverbs.ErrClosed once the queue is closed.
+func (q *queue) produce(n int, fill func(i int, slot []byte) error) (int, error) {
+	done := 0
+	err := q.mem.Do(func(b []byte) error {
+		// The kernel only frees slots meanwhile, so a snapshot of its
+		// consumer index can stop the batch early but never overrun it.
+		prod := q.producer(b)
+		cons := q.consumer(b)
 
-	return nil
+		var err error
+		for ; done < n; done++ {
+			slot := (prod + uint32(done)) & q.mask
+			if (slot+1)&q.mask == cons {
+				err = errQueueFull
+				break
+			}
+
+			if err = fill(done, q.elem(b, slot)); err != nil {
+				break
+			}
+		}
+
+		// One update publishes every slot filled so far.
+		if done > 0 {
+			q.setProducer(b, (prod+uint32(done))&q.mask)
+		}
+
+		return err
+	})
+
+	return done, err
 }
 
-func (q *queue) unlock() { q.mu.Unlock() }
+// consume reads up to n slots the kernel produced with read, in order, and
+// hands them back with a single consumer update. It returns how many it
+// consumed; fewer than n means the ring ran empty, which is not an error. It
+// fails with uverbs.ErrClosed once the queue is closed.
+func (q *queue) consume(n int, read func(i int, slot []byte) error) (int, error) {
+	done := 0
+	err := q.mem.Do(func(b []byte) error {
+		// The kernel only adds entries meanwhile, so a snapshot of its
+		// producer index can stop the batch early but never overrun it.
+		cons := q.consumer(b)
+		prod := q.producer(b)
 
-// close unmaps the ring. Closing a closed queue does nothing.
-func (q *queue) close() error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+		var err error
+		for ; done < n; done++ {
+			slot := (cons + uint32(done)) & q.mask
+			if slot == prod {
+				break
+			}
 
-	return q.closeLocked()
+			if err = read(done, q.elem(b, slot)); err != nil {
+				break
+			}
+		}
+
+		if done > 0 {
+			q.setConsumer(b, (cons+uint32(done))&q.mask)
+		}
+
+		return err
+	})
+
+	return done, err
 }
 
-// closeLocked is close for a caller that holds the lock.
-func (q *queue) closeLocked() error {
-	if q.mem == nil {
-		return nil
-	}
-
-	err := q.mem.Close()
-	q.mem, q.buf = nil, nil
-	return err
-}
+// close unmaps the ring, after any running do call returns. Closing a closed
+// queue does nothing.
+func (q *queue) close() error { return q.mem.Close() }
 
 func (q *queue) elemSize() int { return 1 << q.log2Elem }
 
-func (q *queue) index(off int) *uint32 {
-	return (*uint32)(unsafe.Pointer(&q.buf[off]))
+// The helpers below work on the ring memory b inside produce and consume.
+// Indices are read and written atomically; the kernel pairs them with acquire
+// and release ordering, so slots are complete before an index update
+// publishes them.
+
+func index(b []byte, off int) *uint32 {
+	return (*uint32)(unsafe.Pointer(&b[off]))
 }
 
-func (q *queue) producer() uint32 { return atomic.LoadUint32(q.index(queueProducer)) }
-func (q *queue) consumer() uint32 { return atomic.LoadUint32(q.index(queueConsumer)) }
+func (q *queue) producer(b []byte) uint32 { return atomic.LoadUint32(index(b, queueProducer)) }
+func (q *queue) consumer(b []byte) uint32 { return atomic.LoadUint32(index(b, queueConsumer)) }
 
-func (q *queue) setProducer(i uint32) { atomic.StoreUint32(q.index(queueProducer), i) }
-func (q *queue) setConsumer(i uint32) { atomic.StoreUint32(q.index(queueConsumer), i) }
-
-func (q *queue) full(prod uint32) bool { return q.consumer() == (prod+1)&q.mask }
+func (q *queue) setProducer(b []byte, i uint32) { atomic.StoreUint32(index(b, queueProducer), i) }
+func (q *queue) setConsumer(b []byte, i uint32) { atomic.StoreUint32(index(b, queueConsumer), i) }
 
 // elem returns the element at index i.
-func (q *queue) elem(i uint32) []byte {
-	off := queueData + int(i&q.mask)<<q.log2Elem
-	return q.buf[off : off+q.elemSize()]
+func (q *queue) elem(b []byte, i uint32) []byte {
+	size := q.elemSize()
+	off := queueData + int(i&q.mask)*size
+	return b[off : off+size]
 }

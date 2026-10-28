@@ -26,11 +26,11 @@ func (p *provider) CreateQP(pd *rdma.PD, attr *rdma.QPInitAttr) (*rdma.QP, error
 		return nil, err
 	}
 
-	var rq, sq *queue
+	var sq, rq *queue
 	if _, err = binary.Decode(out, binary.NativeEndian, &resp); err != nil {
 		err = fmt.Errorf("rxe: decoding create QP response: %w", err)
-	} else if rq, err = mapQueue(p.dev, resp.RQ); err == nil {
-		if sq, err = mapQueue(p.dev, resp.SQ); err != nil {
+	} else if rq, err = newQueue(p.dev, resp.RQ); err == nil {
+		if sq, err = newQueue(p.dev, resp.SQ); err != nil {
 			_ = rq.close()
 		}
 	}
@@ -40,105 +40,85 @@ func (p *provider) CreateQP(pd *rdma.PD, attr *rdma.QPInitAttr) (*rdma.QP, error
 		return nil, err
 	}
 
-	q := &queuePair{dev: p.dev, qp: qp, cap: qp.Cap, sq: sq, rq: rq}
-	if err := p.addQP(q); err != nil {
-		_ = q.close()
-		_ = p.dev.Cmd().DestroyQP(qp)
-		return nil, err
-	}
-
-	qp.SetProviderData(q)
+	qp.SetProviderData(&queuePair{
+		sq: &sendQueue{
+			q:         sq,
+			dev:       p.dev,
+			qp:        qp,
+			maxSGE:    qp.Cap.MaxSendSGE,
+			maxInline: qp.Cap.MaxInlineData,
+		},
+		rq: &recvQueue{q: rq, qp: qp, maxSGE: qp.Cap.MaxRecvSGE},
+	})
 	return qp, nil
 }
 
 func (p *provider) DestroyQP(qp *rdma.QP) error {
-	q, err := qpOf(qp)
-	if err != nil {
-		return err
+	pair, ok := qp.ProviderData[*queuePair]()
+	if !ok || pair == nil {
+		return errForeignQP
 	}
-
-	// Holding the rings' locks makes concurrent posts wait, and the closed
-	// rings make later posts fail. The send queue's lock comes first.
-	if err := q.sq.lock(); err != nil {
-		return err
-	}
-	defer q.sq.unlock()
-
-	if err := q.rq.lock(); err != nil {
-		return err
-	}
-	defer q.rq.unlock()
 
 	if err := p.dev.Cmd().DestroyQP(qp); err != nil {
 		return err
 	}
 
-	p.removeQP(q)
-	return errors.Join(q.sq.closeLocked(), q.rq.closeLocked())
+	// Closing waits for running posts, and later posts fail.
+	return errors.Join(pair.sq.q.close(), pair.rq.q.close())
 }
 
 func (p *provider) PostSend(qp *rdma.QP, wr ...rdma.SendWR) error {
-	q, err := qpOf(qp)
-	if err != nil {
-		return err
+	pair, ok := qp.ProviderData[*queuePair]()
+	if !ok || pair == nil {
+		return errForeignQP
 	}
 
-	return q.postSend(wr)
+	return pair.sq.post(wr)
 }
 
 func (p *provider) PostRecv(qp *rdma.QP, wr ...rdma.RecvWR) error {
-	q, err := qpOf(qp)
-	if err != nil {
-		return err
+	pair, ok := qp.ProviderData[*queuePair]()
+	if !ok || pair == nil {
+		return errForeignQP
 	}
 
-	return q.postRecv(wr)
+	return pair.rq.post(wr)
 }
 
-// qpOf returns the rxe state of qp.
-func qpOf(qp *rdma.QP) (*queuePair, error) {
-	q, ok := qp.ProviderData[*queuePair]()
-	if !ok || q == nil {
-		return nil, errForeignQP
-	}
-
-	return q, nil
-}
-
-// queuePair is the provider state of a QP: its mapped send and receive
-// queues.
+// queuePair is the provider state of a QP: its send and receive queues.
 type queuePair struct {
-	dev *rdma.Device
-	qp  *rdma.QP
-	cap rdma.QPCap
-
-	sq *queue
-	rq *queue
+	sq *sendQueue
+	rq *recvQueue
 }
 
-func (p *queuePair) postSend(wrs []rdma.SendWR) error {
-	if err := p.sq.lock(); err != nil {
-		return err
-	}
+// A sendQueue is a QP's send queue: the ring of send WQEs that the kernel
+// consumes after a doorbell.
+type sendQueue struct {
+	q         *queue
+	dev       *rdma.Device
+	qp        *rdma.QP
+	maxSGE    uint32
+	maxInline uint32
+}
 
-	var (
-		err    error
-		posted int
-	)
-
-	for i := range wrs {
-		if err = p.postOneSend(&wrs[i]); err != nil {
-			err = fmt.Errorf("rxe: post send work request %d: %w", wrs[i].WRID, err)
-			break
+// post writes wrs to the ring and rings the doorbell.
+func (s *sendQueue) post(wrs []rdma.SendWR) error {
+	posted, err := s.q.produce(len(wrs), func(i int, slot []byte) error {
+		w, err := s.wqe(&wrs[i])
+		if err != nil {
+			return err
 		}
 
-		posted++
+		return w.encode(slot)
+	})
+	if err != nil && posted < len(wrs) {
+		err = fmt.Errorf("rxe: post send work request %d: %w", wrs[posted].WRID, err)
 	}
 
-	p.sq.unlock()
-
+	// Ring the doorbell for what was posted, even if a later work request
+	// failed.
 	if posted > 0 {
-		if derr := p.ringSendDoorbell(); derr != nil {
+		if derr := s.ringDoorbell(); derr != nil {
 			return errors.Join(err, derr)
 		}
 	}
@@ -146,15 +126,10 @@ func (p *queuePair) postSend(wrs []rdma.SendWR) error {
 	return err
 }
 
-func (p *queuePair) postOneSend(wr *rdma.SendWR) error {
-	q := p.sq
-	prod := q.producer()
-	if q.full(prod) {
-		return errQueueFull
-	}
-
-	if uint32(len(wr.SGList)) > p.cap.MaxSendSGE {
-		return fmt.Errorf("%d SGEs exceeds maximum of %d", len(wr.SGList), p.cap.MaxSendSGE)
+// wqe checks wr against the queue's limits and builds its WQE.
+func (s *sendQueue) wqe(wr *rdma.SendWR) (rxeSendWQE, error) {
+	if uint32(len(wr.SGList)) > s.maxSGE {
+		return rxeSendWQE{}, fmt.Errorf("%d SGEs exceeds maximum of %d", len(wr.SGList), s.maxSGE)
 	}
 
 	var length uint64
@@ -163,13 +138,13 @@ func (p *queuePair) postOneSend(wr *rdma.SendWR) error {
 	}
 
 	inline := wr.SendFlags&rdma.SendInline != 0
-	if inline && length > uint64(p.cap.MaxInlineData) {
-		return fmt.Errorf("%d bytes of inline data exceeds maximum of %d", length, p.cap.MaxInlineData)
+	if inline && length > uint64(s.maxInline) {
+		return rxeSendWQE{}, fmt.Errorf("%d bytes of inline data exceeds maximum of %d", length, s.maxInline)
 	}
 
 	isAtomic := wr.Opcode == rdma.WRAtomicCmpAndSwp || wr.Opcode == rdma.WRAtomicFetchAndAdd
 	if isAtomic && (length < 8 || wr.RemoteAddr&7 != 0) {
-		return errAtomicAlignment
+		return rxeSendWQE{}, errAtomicAlignment
 	}
 
 	w := rxeSendWQE{
@@ -201,54 +176,45 @@ func (p *queuePair) postOneSend(wr *rdma.SendWR) error {
 		w.Atomic, w.CompareAdd, w.Swap = true, wr.CompareAdd, wr.Swap
 	}
 
-	if err := w.encode(q.elem(prod)); err != nil {
-		return err
-	}
-
-	q.setProducer((prod + 1) & q.mask)
-	return nil
+	return w, nil
 }
 
-// ringSendDoorbell tells the kernel there is new work on the send queue
-// with an empty POST_SEND command.
-func (p *queuePair) ringSendDoorbell() error {
+// ringDoorbell tells the kernel there is new work on the send queue with an
+// empty POST_SEND command.
+func (s *sendQueue) ringDoorbell() error {
 	// struct ib_uverbs_post_send with no work requests.
 	in := make([]byte, 24)
 	ne := binary.NativeEndian
-	ne.PutUint32(in[8:], p.qp.Handle)
+	ne.PutUint32(in[8:], s.qp.Handle)
 	ne.PutUint32(in[20:], sizeofUverbsSendWR)
 
 	// struct ib_uverbs_post_send_resp.
 	var badWR uint32
-	if err := p.dev.Conn().ExecuteWrite(unix.IB_USER_VERBS_CMD_POST_SEND, in, &badWR); err != nil {
+	if err := s.dev.Conn().ExecuteWrite(unix.IB_USER_VERBS_CMD_POST_SEND, in, &badWR); err != nil {
 		return fmt.Errorf("rxe: ring send doorbell: %w", err)
 	}
 
 	return nil
 }
 
-func (p *queuePair) postRecv(wrs []rdma.RecvWR) error {
-	if p.qp.State() == rdma.QPStateReset {
+// A recvQueue is a QP's receive queue: the ring of receive WQEs that the
+// kernel consumes as messages arrive.
+type recvQueue struct {
+	q      *queue
+	qp     *rdma.QP
+	maxSGE uint32
+}
+
+// post writes wrs to the ring.
+func (r *recvQueue) post(wrs []rdma.RecvWR) error {
+	if r.qp.State() == rdma.QPStateReset {
 		return errQPReset
 	}
 
-	q := p.rq
-	if err := q.lock(); err != nil {
-		return err
-	}
-	defer q.unlock()
-
-	for i := range wrs {
+	posted, err := r.q.produce(len(wrs), func(i int, slot []byte) error {
 		wr := &wrs[i]
-
-		prod := q.producer()
-		if q.full(prod) {
-			return fmt.Errorf("rxe: post receive work request %d: %w", wr.WRID, errQueueFull)
-		}
-
-		if uint32(len(wr.SGList)) > p.cap.MaxRecvSGE {
-			return fmt.Errorf("rxe: post receive work request %d: %d SGEs exceeds maximum of %d",
-				wr.WRID, len(wr.SGList), p.cap.MaxRecvSGE)
+		if uint32(len(wr.SGList)) > r.maxSGE {
+			return fmt.Errorf("%d SGEs exceeds maximum of %d", len(wr.SGList), r.maxSGE)
 		}
 
 		var length uint32
@@ -266,19 +232,13 @@ func (p *queuePair) postRecv(wrs []rdma.RecvWR) error {
 			},
 		}
 
-		if err := w.encode(q.elem(prod)); err != nil {
-			return fmt.Errorf("rxe: post receive work request %d: %w", wr.WRID, err)
-		}
-
-		q.setProducer((prod + 1) & q.mask)
+		return w.encode(slot)
+	})
+	if err != nil && posted < len(wrs) {
+		err = fmt.Errorf("rxe: post receive work request %d: %w", wrs[posted].WRID, err)
 	}
 
-	return nil
-}
-
-// close unmaps the QP's rings.
-func (p *queuePair) close() error {
-	return errors.Join(p.sq.close(), p.rq.close())
+	return err
 }
 
 // userBytes returns the n bytes at virtual address addr, which an SGE

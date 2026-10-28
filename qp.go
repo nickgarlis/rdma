@@ -5,6 +5,7 @@ package rdma
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -135,6 +136,7 @@ type QP struct {
 	RecvCQ *CQ
 
 	userHandle uint64
+	destroyed  atomic.Bool
 
 	providerData
 
@@ -230,7 +232,13 @@ func (d *Device) DestroyQP(qp *QP) error {
 		return err
 	}
 
+	// The kernel reuses handles, so a second destroy could hit another QP.
+	if !qp.destroyed.CompareAndSwap(false, true) {
+		return errDestroyed
+	}
+
 	if err := d.provider.DestroyQP(qp); err != nil {
+		qp.destroyed.Store(false)
 		return err
 	}
 

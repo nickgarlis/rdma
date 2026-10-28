@@ -141,6 +141,8 @@ func lookupDevice(name string) (path string, driverID DriverID, err error) {
 
 var errOtherDevice = errors.New("rdma: object belongs to another device")
 
+var errDestroyed = errors.New("rdma: object was already destroyed")
+
 // owns reports an error unless an object created on dev may be used with d.
 // Handles are only meaningful on the device file that created them, so an
 // object from another Device would refer to an unrelated object on this one.
