@@ -17,12 +17,12 @@ func TestCompChannel(t *testing.T) {
 		t.Fatalf("ReqNotifyCQ: %v", err)
 	}
 
-	_, dstSGE := p.slot(1, regionSize)
+	dstSGE := p.slot(1, regionSize)
 	if err := p.dev.PostRecv(p.qpB, rdma.RecvWR{WRID: 1, SGList: []rdma.SGE{dstSGE}}); err != nil {
 		t.Fatalf("PostRecv: %v", err)
 	}
 
-	_, srcSGE := p.slot(0, 16)
+	srcSGE := p.slot(0, 16)
 	if err := p.dev.PostSend(p.qpA, rdma.SendWR{WRID: 2, Opcode: rdma.WRSend, SGList: []rdma.SGE{srcSGE}}); err != nil {
 		t.Fatalf("PostSend: %v", err)
 	}

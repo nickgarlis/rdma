@@ -52,8 +52,8 @@ func (p *provider) AllocPD() (*rdma.PD, error)  { return p.dev.Cmd().AllocPD() }
 func (p *provider) DeallocPD(pd *rdma.PD) error { return p.dev.Cmd().DeallocPD(pd) }
 func (p *provider) DeregMR(mr *rdma.MR) error   { return p.dev.Cmd().DeregMR(mr) }
 
-func (p *provider) RegMR(pd *rdma.PD, mem rdma.MemoryRange, access rdma.AccessFlags) (*rdma.MR, error) {
-	return p.dev.Cmd().RegMR(pd, mem, access)
+func (p *provider) RegMR(pd *rdma.PD, addr, length uint64, access rdma.AccessFlags) (*rdma.MR, error) {
+	return p.dev.Cmd().RegMR(pd, addr, length, access)
 }
 
 func (p *provider) ReqNotifyCQ(cq *rdma.CQ, solicitedOnly bool) error {

@@ -28,7 +28,7 @@ type Provider interface {
 
 	AllocPD() (*PD, error)
 	DeallocPD(pd *PD) error
-	RegMR(pd *PD, mem MemoryRange, access AccessFlags) (*MR, error)
+	RegMR(pd *PD, addr, length uint64, access AccessFlags) (*MR, error)
 	DeregMR(mr *MR) error
 
 	CreateCQ(cqe uint32, channel *CompChannel, compVector uint32) (*CQ, error)

@@ -301,16 +301,11 @@ func (c Cmd) DeallocPD(pd *PD) error {
 	return nil
 }
 
-// RegMR registers mem as a memory region of pd with the write command
-// REG_MR. The native UVERBS_METHOD_REG_MR does not record the MR's IOVA and
+// RegMR registers length bytes at addr as a memory region of pd, with the
+// MR's I/O virtual address set to addr, using the write command REG_MR. The native UVERBS_METHOD_REG_MR does not record the MR's IOVA and
 // length in the core (as of Linux 7.3), which breaks drivers such as rxe
 // that check ranges against them.
-func (c Cmd) RegMR(pd *PD, mem MemoryRange, access AccessFlags) (*MR, error) {
-	addr, length := mem.Addr(), uint64(mem.Len())
-	if length == 0 {
-		return nil, fmt.Errorf("rdma: register MR: memory is empty or closed")
-	}
-
+func (c Cmd) RegMR(pd *PD, addr, length uint64, access AccessFlags) (*MR, error) {
 	var resp regMRResp
 	if err := c.d.conn.ExecuteWrite(unix.IB_USER_VERBS_CMD_REG_MR, &regMR{
 		Start:       addr,

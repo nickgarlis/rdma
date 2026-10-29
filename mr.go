@@ -2,7 +2,12 @@
 
 package rdma
 
-import "golang.org/x/sys/unix"
+import (
+	"errors"
+	"fmt"
+
+	"golang.org/x/sys/unix"
+)
 
 // AccessFlags control the operations allowed on a memory region or by a QP's
 // remote peers.
@@ -39,32 +44,40 @@ type MR struct {
 	providerData
 }
 
-// A MemoryRange is memory that can be registered as a memory region, such as
-// a *Memory. An implementation promises that the range stays at Addr, Len
-// bytes long, and is not freed or moved until the MR is deregistered. Memory
-// from the Go heap breaks that promise: the garbage collector may free it
-// while the device still writes into it. Use AllocMemory, or memory mapped
-// or allocated outside Go, such as huge pages from unix.Mmap.
-type MemoryRange interface {
-	Addr() uint64
-	Len() int
-}
-
-// RegMR registers mem as a memory region of pd with the given access rights,
-// like ibv_reg_mr. The MR's I/O virtual address, which peers use in RDMA
-// reads and writes, is mem.Addr(). The device may access mem until the MR is
-// deregistered, so deregister it before releasing mem.
-func (d *Device) RegMR(pd *PD, mem MemoryRange, access AccessFlags) (*MR, error) {
+// RegMR registers the memory of pool as a memory region of pd with the given
+// access rights, like ibv_reg_mr. The MR's I/O virtual address, which peers
+// use in RDMA reads and writes, is the address of the pool's first buffer.
+// The device may access the memory until the MR is deregistered, so
+// deregister it before closing the pool.
+func (d *Device) RegMR(pd *PD, pool *BufferPool, access AccessFlags) (*MR, error) {
 	if err := d.owns(pd.Device); err != nil {
 		return nil, err
 	}
 
-	return d.provider.RegMR(pd, mem, access)
+	addr, length := pool.span()
+	if length == 0 {
+		return nil, fmt.Errorf("rdma: register MR: %w", ErrPoolClosed)
+	}
+
+	return d.provider.RegMR(pd, addr, length, access)
 }
 
-// SGE returns a scatter/gather element for length bytes at offset in the MR.
-func (mr *MR) SGE(offset, length uint32) SGE {
-	return SGE{Addr: mr.Addr + uint64(offset), Length: length, LKey: mr.LKey}
+// RegMRUnsafe registers length bytes at addr as a memory region of pd, for
+// memory that does not come from a BufferPool, such as memory mapped by
+// another library. The caller promises that the memory stays mapped, is not
+// moved and is not used for anything else until the MR is deregistered. Go
+// heap memory breaks that promise: the garbage collector may reuse it while
+// the device still writes into it.
+func (d *Device) RegMRUnsafe(pd *PD, addr, length uint64, access AccessFlags) (*MR, error) {
+	if err := d.owns(pd.Device); err != nil {
+		return nil, err
+	}
+
+	if length == 0 {
+		return nil, errors.New("rdma: register MR: empty memory")
+	}
+
+	return d.provider.RegMR(pd, addr, length, access)
 }
 
 // DeregMR deregisters mr. mr must not be used afterwards: the kernel reuses

@@ -10,12 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// mapped is memory the caller maps itself, registered through MemoryRange.
-type mapped []byte
-
-func (m mapped) Addr() uint64 { return uint64(uintptr(unsafe.Pointer(&m[0]))) }
-func (m mapped) Len() int     { return len(m) }
-
 func TestRegMRCallerMemory(t *testing.T) {
 	dev := openDevice(t)
 
@@ -33,13 +27,15 @@ func TestRegMRCallerMemory(t *testing.T) {
 
 	t.Cleanup(func() { _ = unix.Munmap(b) })
 
-	mr, err := dev.RegMR(pd, mapped(b), rdma.AccessLocalWrite)
+	// Memory mapped by the caller goes through the escape hatch.
+	addr := uint64(uintptr(unsafe.Pointer(&b[0])))
+	mr, err := dev.RegMRUnsafe(pd, addr, uint64(len(b)), rdma.AccessLocalWrite)
 	if err != nil {
-		t.Fatalf("RegMR: %v", err)
+		t.Fatalf("RegMRUnsafe: %v", err)
 	}
 
-	if mr.Addr != mapped(b).Addr() || mr.Length != uint64(len(b)) {
-		t.Fatalf("MR covers %#x+%d, want %#x+%d", mr.Addr, mr.Length, mapped(b).Addr(), len(b))
+	if mr.Addr != addr || mr.Length != uint64(len(b)) {
+		t.Fatalf("MR covers %#x+%d, want %#x+%d", mr.Addr, mr.Length, addr, len(b))
 	}
 
 	if err := dev.DeregMR(mr); err != nil {

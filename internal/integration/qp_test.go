@@ -14,14 +14,13 @@ import (
 // pair is two RC QPs on the same device, connected to each other.
 type pair struct {
 	dev    *rdma.Device
-	mem    *rdma.Memory
 	mr     *rdma.MR
 	ch     *rdma.CompChannel
 	cqA    *rdma.CQ
 	cqB    *rdma.CQ
 	qpA    *rdma.QP
 	qpB    *rdma.QP
-	buf    []byte
+	bufs   []*rdma.Buffer // one per region
 	region int
 }
 
@@ -42,15 +41,19 @@ func newPair(t *testing.T) *pair {
 
 	t.Cleanup(func() { closeOK(t, "PD", func() error { return dev.DeallocPD(pd) }) })
 
-	p.mem, err = rdma.AllocMemory(4 * regionSize)
+	pool, err := rdma.NewBufferPool(4, regionSize)
 	if err != nil {
-		t.Fatalf("AllocMemory: %v", err)
+		t.Fatalf("NewBufferPool: %v", err)
 	}
 
-	t.Cleanup(func() { closeOK(t, "Memory", p.mem.Close) })
-	p.buf = p.mem.Bytes()
+	t.Cleanup(func() { closeOK(t, "BufferPool", pool.Close) })
 
-	p.mr, err = dev.RegMR(pd, p.mem, rdma.AccessLocalWrite|rdma.AccessRemoteWrite|
+	p.bufs = make([]*rdma.Buffer, 4)
+	for i := range p.bufs {
+		p.bufs[i] = pool.Lookup(uint64(i))
+	}
+
+	p.mr, err = dev.RegMR(pd, pool, rdma.AccessLocalWrite|rdma.AccessRemoteWrite|
 		rdma.AccessRemoteRead|rdma.AccessRemoteAtomic)
 	if err != nil {
 		t.Fatalf("RegMR: %v", err)
@@ -156,10 +159,36 @@ func connect(t *testing.T, dev *rdma.Device, qp, remote *rdma.QP, gid rdma.GIDEn
 	}
 }
 
-// slot returns region i of the shared buffer and its SGE.
-func (p *pair) slot(i int, n uint32) ([]byte, rdma.SGE) {
-	off := i * p.region
-	return p.buf[off : off+int(n)], p.mr.SGE(uint32(off), n)
+// slot returns the SGE of the first n bytes of region i.
+func (p *pair) slot(i int, n uint32) rdma.SGE {
+	return rdma.SGE{Addr: p.bufs[i].Addr(), Length: n, LKey: p.mr.LKey}
+}
+
+// write copies data to offset off of region i.
+func (p *pair) write(t *testing.T, i, off int, data []byte) {
+	t.Helper()
+
+	if err := p.bufs[i].Do(func(b []byte) error {
+		copy(b[off:], data)
+		return nil
+	}); err != nil {
+		t.Fatalf("write region %d: %v", i, err)
+	}
+}
+
+// read returns a copy of the n bytes at offset off of region i.
+func (p *pair) read(t *testing.T, i, off, n int) []byte {
+	t.Helper()
+
+	var out []byte
+	if err := p.bufs[i].Do(func(b []byte) error {
+		out = bytes.Clone(b[off : off+n])
+		return nil
+	}); err != nil {
+		t.Fatalf("read region %d: %v", i, err)
+	}
+
+	return out
 }
 
 // poll waits for one completion on cq and checks its ID and status.
@@ -198,10 +227,10 @@ func TestSendRecv(t *testing.T) {
 	p := newPair(t)
 
 	msg := []byte("hello from qp A over soft-RoCE")
-	src, srcSGE := p.slot(0, uint32(len(msg)))
-	copy(src, msg)
+	srcSGE := p.slot(0, uint32(len(msg)))
+	p.write(t, 0, 0, msg)
 
-	dst, dstSGE := p.slot(1, regionSize)
+	dstSGE := p.slot(1, regionSize)
 	if err := p.dev.PostRecv(p.qpB, rdma.RecvWR{WRID: 1, SGList: []rdma.SGE{dstSGE}}); err != nil {
 		t.Fatalf("PostRecv: %v", err)
 	}
@@ -229,8 +258,8 @@ func TestSendRecv(t *testing.T) {
 		t.Fatalf("immediate data %#x (flags %#x), want 0x12345678", wc.ImmData, wc.WCFlags)
 	}
 
-	if !bytes.Equal(dst[:len(msg)], msg) {
-		t.Fatalf("received %q, want %q", dst[:len(msg)], msg)
+	if got := p.read(t, 1, 0, len(msg)); !bytes.Equal(got, msg) {
+		t.Fatalf("received %q, want %q", got, msg)
 	}
 }
 
@@ -238,10 +267,10 @@ func TestSendInline(t *testing.T) {
 	p := newPair(t)
 
 	msg := []byte("inline")
-	src, srcSGE := p.slot(0, uint32(len(msg)))
-	copy(src, msg)
+	srcSGE := p.slot(0, uint32(len(msg)))
+	p.write(t, 0, 0, msg)
 
-	dst, dstSGE := p.slot(1, regionSize)
+	dstSGE := p.slot(1, regionSize)
 	if err := p.dev.PostRecv(p.qpB, rdma.RecvWR{WRID: 1, SGList: []rdma.SGE{dstSGE}}); err != nil {
 		t.Fatalf("PostRecv: %v", err)
 	}
@@ -258,25 +287,26 @@ func TestSendInline(t *testing.T) {
 		t.Fatalf("PostSend: %v", err)
 	}
 
-	clear(src)
+	p.write(t, 0, 0, make([]byte, len(msg)))
 
 	poll(t, p.dev, p.cqA, 2)
 	poll(t, p.dev, p.cqB, 1)
 
-	if !bytes.Equal(dst[:len(msg)], msg) {
-		t.Fatalf("received %q, want %q", dst[:len(msg)], msg)
+	if got := p.read(t, 1, 0, len(msg)); !bytes.Equal(got, msg) {
+		t.Fatalf("received %q, want %q", got, msg)
 	}
 }
 
 func TestRDMAWriteRead(t *testing.T) {
 	p := newPair(t)
 
-	src, srcSGE := p.slot(0, 512)
+	src := make([]byte, 512)
 	for i := range src {
 		src[i] = byte(i)
 	}
 
-	remote, _ := p.slot(1, 512)
+	srcSGE := p.slot(0, 512)
+	p.write(t, 0, 0, src)
 	remoteAddr := p.mr.Addr + uint64(regionSize)
 
 	if err := p.dev.PostSend(p.qpA, rdma.SendWR{
@@ -294,12 +324,12 @@ func TestRDMAWriteRead(t *testing.T) {
 		t.Fatalf("write completion opcode %d, want WCRDMAWrite", wc.Opcode)
 	}
 
-	if !bytes.Equal(remote, src) {
+	if !bytes.Equal(p.read(t, 1, 0, 512), src) {
 		t.Fatal("RDMA write did not update the remote buffer")
 	}
 
 	// Read the data back into a third region.
-	dst, dstSGE := p.slot(2, 512)
+	dstSGE := p.slot(2, 512)
 	if err := p.dev.PostSend(p.qpA, rdma.SendWR{
 		WRID:       2,
 		Opcode:     rdma.WRRDMARead,
@@ -315,7 +345,7 @@ func TestRDMAWriteRead(t *testing.T) {
 		t.Fatalf("read completion opcode %d, want WCRDMARead", wc.Opcode)
 	}
 
-	if !bytes.Equal(dst, src) {
+	if !bytes.Equal(p.read(t, 2, 0, 512), src) {
 		t.Fatal("RDMA read returned different data")
 	}
 }
@@ -323,11 +353,10 @@ func TestRDMAWriteRead(t *testing.T) {
 func TestAtomics(t *testing.T) {
 	p := newPair(t)
 
-	counter, _ := p.slot(1, 8)
-	binary.NativeEndian.PutUint64(counter, 40)
+	p.write(t, 1, 0, binary.NativeEndian.AppendUint64(nil, 40))
 	remoteAddr := p.mr.Addr + uint64(regionSize)
 
-	old, oldSGE := p.slot(0, 8)
+	oldSGE := p.slot(0, 8)
 	if err := p.dev.PostSend(p.qpA, rdma.SendWR{
 		WRID:       1,
 		Opcode:     rdma.WRAtomicFetchAndAdd,
@@ -342,7 +371,7 @@ func TestAtomics(t *testing.T) {
 
 	poll(t, p.dev, p.cqA, 1)
 
-	if got := binary.NativeEndian.Uint64(old); got != 40 {
+	if got := binary.NativeEndian.Uint64(p.read(t, 0, 0, 8)); got != 40 {
 		t.Fatalf("fetch and add returned %d, want 40", got)
 	}
 
@@ -361,7 +390,7 @@ func TestAtomics(t *testing.T) {
 
 	poll(t, p.dev, p.cqA, 2)
 
-	if got := binary.NativeEndian.Uint64(counter); got != 7 {
+	if got := binary.NativeEndian.Uint64(p.read(t, 1, 0, 8)); got != 7 {
 		t.Fatalf("counter is %d after compare and swap, want 7", got)
 	}
 }
