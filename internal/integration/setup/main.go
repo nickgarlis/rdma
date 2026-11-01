@@ -12,7 +12,7 @@ import (
 	"os"
 
 	"github.com/jsimonetti/rtnetlink/v2"
-	"github.com/nickgarlis/rdma/nldev"
+	"github.com/nickgarlis/rdmanl"
 	"golang.org/x/sys/unix"
 )
 
@@ -98,11 +98,11 @@ func setupNetdev() error {
 // addRXELink is the equivalent of "rdma link add <name> type rxe netdev
 // <netdev>".
 func addRXELink(name, netdev string) error {
-	c, err := nldev.Dial(nil)
+	c, err := rdmanl.Open(nil)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
-	return c.NewLink(name, "rxe", netdev)
+	return c.NewLink(rdmanl.NewLinkReq{DevName: name, LinkType: "rxe", NdevName: netdev})
 }

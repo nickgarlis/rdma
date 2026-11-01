@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/jsimonetti/rtnetlink/v2 v2.2.0
 	github.com/nickgarlis/rdma v0.0.0
+	github.com/nickgarlis/rdmanl v0.1.0
 	golang.org/x/sys v0.49.0
 )
 

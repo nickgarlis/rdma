@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/mdlayher/netlink v1.11.2
 	github.com/mdlayher/socket v0.8.0
+	github.com/nickgarlis/rdmanl v0.1.0
 	golang.org/x/sys v0.49.0
 )
 

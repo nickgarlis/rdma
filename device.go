@@ -9,8 +9,8 @@ import (
 
 	"github.com/mdlayher/netlink"
 	"github.com/mdlayher/socket"
-	"github.com/nickgarlis/rdma/nldev"
 	"github.com/nickgarlis/rdma/uverbs"
+	"github.com/nickgarlis/rdmanl"
 	"golang.org/x/sys/unix"
 )
 
@@ -108,9 +108,9 @@ func newEventFile(fd int, name string) (*socket.Conn, error) {
 // lookupDevice finds the RDMA device with the given name with RDMA netlink
 // and returns its uverbs character device and driver ID.
 func lookupDevice(name string) (path string, driverID DriverID, err error) {
-	conn, err := nldev.Dial(nil)
+	conn, err := rdmanl.Open(nil)
 	if err != nil {
-		return "", 0, fmt.Errorf("rdma: dial RDMA netlink: %w", err)
+		return "", 0, fmt.Errorf("rdma: open RDMA netlink: %w", err)
 	}
 	defer conn.Close()
 
@@ -124,7 +124,7 @@ func lookupDevice(name string) (path string, driverID DriverID, err error) {
 			continue
 		}
 
-		cd, err := conn.Chardev(dev.Index, "uverbs")
+		cd, err := conn.Chardev(rdmanl.ChardevReq{DevIndex: &dev.Index, ChardevType: "uverbs"})
 		if err != nil {
 			if _, ok := errors.AsType[*netlink.OpError](err); ok {
 				return "", 0, fmt.Errorf("rdma: device %q has no uverbs character device; is ib_uverbs loaded?", name)
